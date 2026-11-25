@@ -1,0 +1,248 @@
+
+name: ZUNO 5.1.0 Android Build
+
+on:
+  push:
+    paths:
+      - 'ZUNO-Android-5.1.0-Black-Gold-UI-Complete-Source.zip'
+      - '.github/workflows/zuno-android-build.yml'
+
+  pull_request:
+    paths:
+      - 'ZUNO-Android-5.1.0-Black-Gold-UI-Complete-Source.zip'
+      - '.github/workflows/zuno-android-build.yml'
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zuno-android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build ZUNO Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+
+      - name: Verify ZIP Filename and Integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ZIP_FILE="ZUNO-Android-5.1.0-Black-Gold-UI-Complete-Source.zip"
+
+          if [[ ! -f "$ZIP_FILE" ]]; then
+            echo "ERROR: ZIP file not found: $ZIP_FILE"
+            exit 1
+          fi
+
+          unzip -tq "$ZIP_FILE"
+          echo "ZIP integrity verified."
+
+      - name: Extract ZUNO Source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ZIP_FILE="ZUNO-Android-5.1.0-Black-Gold-UI-Complete-Source.zip"
+
+          rm -rf _zuno_source
+          mkdir -p _zuno_source
+
+          unzip -q "$ZIP_FILE" -d _zuno_source
+
+          SETTINGS_FILE="$(
+            find _zuno_source -type f \
+              -name settings.gradle -print -quit
+          )"
+
+          if [[ -z "$SETTINGS_FILE" ]]; then
+            echo "ERROR: settings.gradle not found."
+            exit 1
+          fi
+
+          PROJECT_DIR="${SETTINGS_FILE%/settings.gradle}"
+
+          REQUIRED_FILES=(
+            "settings.gradle"
+            "build.gradle"
+            "app/build.gradle"
+            "app/src/main/AndroidManifest.xml"
+            "gradlew"
+            "gradle/wrapper/gradle-wrapper.jar"
+            "gradle/wrapper/gradle-wrapper.properties"
+          )
+
+          for FILE in "${REQUIRED_FILES[@]}"; do
+            if [[ ! -f "$PROJECT_DIR/$FILE" ]]; then
+              echo "ERROR: Missing $FILE"
+              exit 1
+            fi
+          done
+
+          chmod +x "$PROJECT_DIR/gradlew"
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+          echo "ZUNO source extracted successfully."
+
+      - name: Set Up JDK 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set Up Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --disable-pip-version-check numpy
+
+      - name: Validate Python Source
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          python -m compileall -q \
+            developer-tools/NEXAS_PUREVIEW_TOOLKIT/tools
+
+      - name: Validate TFLite Models
+        working-directory: ${{ env.PROJECT_DIR }}/developer-tools/NEXAS_PUREVIEW_TOOLKIT
+        run: |
+          python tools/validate_generated_models.py
+          python tools/sync_model_hashes.py --check
+
+      - name: Verify AI Model Checksums
+        working-directory: ${{ env.PROJECT_DIR }}/app/src/main/assets/models
+        run: |
+          sha256sum -c MODEL_SHA256SUMS.txt
+
+      # Use the runner's preinstalled Android SDK.
+      # Do not invoke android-actions/setup-android@v3:
+      # its default obsolete "tools" package caused the previous failure.
+
+      - name: Configure Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+
+          if [[ ! -d "$SDK_ROOT" ]]; then
+            echo "ERROR: Android SDK directory not found: $SDK_ROOT"
+            exit 1
+          fi
+
+          SDKMANAGER="$(
+            find "$SDK_ROOT/cmdline-tools" \
+              -type f -name sdkmanager -print -quit
+          )"
+
+          if [[ -z "$SDKMANAGER" ]]; then
+            echo "ERROR: sdkmanager not found."
+            exit 1
+          fi
+
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+
+          echo "Using SDK: $SDK_ROOT"
+          echo "Using SDK Manager: $SDKMANAGER"
+
+          "$SDKMANAGER" \
+            --sdk_root="$SDK_ROOT" \
+            --licenses < <(yes)
+
+          "$SDKMANAGER" \
+            --sdk_root="$SDK_ROOT" \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
+
+          echo "Android SDK configured successfully."
+
+      - name: Verify Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SDK_ROOT="$ANDROID_SDK_ROOT"
+
+          test -d "$SDK_ROOT/platforms/android-35"
+          test -d "$SDK_ROOT/build-tools/35.0.0"
+          test -x "$SDK_ROOT/platform-tools/adb"
+
+          echo "Android SDK 35 verified."
+
+      - name: Configure Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Verify Gradle Wrapper
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+
+          chmod +x ./gradlew
+          ./gradlew --version
+
+      - name: Run Unit Tests
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          ./gradlew \
+            --no-daemon \
+            --stacktrace \
+            testDebugUnitTest
+
+      - name: Build ZUNO Debug APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          ./gradlew \
+            --no-daemon \
+            --stacktrace \
+            assembleDebug
+
+      - name: Verify APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK="app/build/outputs/apk/debug/app-debug.apk"
+
+          if [[ ! -s "$APK" ]]; then
+            echo "ERROR: APK was not generated."
+            exit 1
+          fi
+
+          echo "ZUNO APK successfully generated."
+          ls -lh "$APK"
+
+          echo "## ZUNO 5.1.0 Build Successful" >> "$GITHUB_STEP_SUMMARY"
+          echo "Debug APK generated and ready." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload ZUNO Debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZUNO-5.1.0-Android-APK
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Build Diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZUNO-5.1.0-Build-Reports
+          path: |
+            _zuno_source/ZUNO/app/build/reports/
+            _zuno_source/ZUNO/app/build/test-results/
+          if-no-files-found: ignore
+          retention-days: 7
